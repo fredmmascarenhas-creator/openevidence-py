@@ -82,6 +82,7 @@ class Article:
         structured = output.get("structured_article", {}) or {}
         sections = []
         all_refs = []
+        seen_ref_titles = set()  # Deduplicate references
 
         for sec_data in structured.get("articlesection_set", []):
             sec = Section(title=sec_data.get("section_title", ""))
@@ -91,18 +92,36 @@ class Article:
                     sec.paragraphs.append(para_text)
                 # Extract references from paragraph
                 for ref_data in para.get("references", []):
-                    ref = Reference(
-                        title=ref_data.get("title", ""),
-                        journal=ref_data.get("journal_name", ""),
-                        year=str(ref_data.get("year", "")),
-                        authors=ref_data.get("authors", ""),
-                        url=ref_data.get("url", ""),
-                        doi=ref_data.get("doi", ""),
-                    )
-                    sec.references.append(ref)
-                    all_refs.append(ref)
+                    ref = cls._parse_reference(ref_data)
+                    if ref and ref.title and ref.title not in seen_ref_titles:
+                        sec.references.append(ref)
+                        all_refs.append(ref)
+                        seen_ref_titles.add(ref.title)
             if sec.paragraphs:
                 sections.append(sec)
+
+        # Also check external_search_results for references
+        for result in structured.get("external_search_results", []) or []:
+            ref = cls._parse_reference(result)
+            if ref and ref.title and ref.title not in seen_ref_titles:
+                all_refs.append(ref)
+                seen_ref_titles.add(ref.title)
+
+        # Also check metadata for references
+        metadata = structured.get("metadata", {}) or {}
+        for ref_data in metadata.get("references", []) or []:
+            ref = cls._parse_reference(ref_data)
+            if ref and ref.title and ref.title not in seen_ref_titles:
+                all_refs.append(ref)
+                seen_ref_titles.add(ref.title)
+
+        # Extract inline references from [[[$$$...$$$]]] markers in text
+        if not all_refs:
+            inline_refs = cls._extract_inline_references(raw_text)
+            for ref in inline_refs:
+                if ref.title not in seen_ref_titles:
+                    all_refs.append(ref)
+                    seen_ref_titles.add(ref.title)
 
         follow_ups = structured.get("follow_up_questions", []) or []
 
@@ -119,17 +138,73 @@ class Article:
             raw_response=data,
         )
 
+    @classmethod
+    def _parse_reference(cls, ref_data: dict) -> Optional[Reference]:
+        """Parse a Reference from various API response formats."""
+        if not ref_data:
+            return None
+        title = (
+            ref_data.get("title", "") or
+            ref_data.get("name", "") or
+            ref_data.get("headline", "") or
+            ""
+        )
+        if not title:
+            return None
+        return Reference(
+            title=title,
+            journal=(
+                ref_data.get("journal_name", "") or
+                ref_data.get("journal", "") or
+                ref_data.get("source", "") or
+                ref_data.get("publisher", "") or
+                ""
+            ),
+            year=str(ref_data.get("year", "") or ref_data.get("date", "") or ""),
+            authors=ref_data.get("authors", "") or ref_data.get("author", "") or "",
+            url=ref_data.get("url", "") or ref_data.get("link", "") or "",
+            doi=ref_data.get("doi", "") or "",
+        )
+
     @staticmethod
     def _clean_text(raw: str) -> str:
-        """Remove REACTCOMPONENT markers, HTML tags, and thinking blocks."""
+        """Remove REACTCOMPONENT markers, HTML tags, thinking/search blocks, inline refs."""
         if not raw:
             return ""
-        # Remove REACTCOMPONENT thinking blocks
+        # Remove REACTCOMPONENT blocks (various formats)
         text = re.sub(
-            r'REACTCOMPONENT!:!Thinking!:!\{.*?\}\n*',
+            r'REACTCOMPONENT!:!\w+!:!\{.*?\}\n*',
             '',
             raw,
             flags=re.DOTALL,
+        )
+        # Remove JSON array/object blocks (thinking/search/reasoning)
+        # Matches patterns like [{"kind":"search",...},{"kind":"reasoning",...}]
+        text = re.sub(
+            r'\[(\s*\{[^]]*"kind"\s*:\s*"[^"]*"[^]]*\})\s*\]',
+            '',
+            text,
+            flags=re.DOTALL,
+        )
+        # Remove standalone JSON thinking objects
+        text = re.sub(
+            r'\{[^}]*"kind"\s*:\s*"(search|reasoning|thinking)"[^}]*\}',
+            '',
+            text,
+        )
+        # Remove inline reference markers [[[$$$...$$$]]] but keep a [ref] marker
+        text = re.sub(
+            r'\[\[\[\$\$\$.*?\$\$\$\]\]\]',
+            '',
+            text,
+            flags=re.DOTALL,
+        )
+        # Also handle [[[$$$...  without closing (truncated refs)
+        text = re.sub(
+            r'\[\[\[\$\$\$[^\]]*$',
+            '',
+            text,
+            flags=re.MULTILINE,
         )
         # Remove HTML bold/strong tags but keep content
         text = re.sub(r'</?strong>', '', text)
@@ -138,6 +213,58 @@ class Article:
         text = re.sub(r'</?i>', '', text)
         # Remove other HTML tags
         text = re.sub(r'<[^>]+>', '', text)
+        # Clean up leading garbage (commas, brackets, whitespace)
+        text = re.sub(r'^[\s,\]\[}{]+', '', text)
         # Clean up extra whitespace
         text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'  +', ' ', text)
         return text.strip()
+
+    @staticmethod
+    def _strip_html(text: str) -> str:
+        """Remove HTML tags from text, extract href URLs."""
+        if not text:
+            return ""
+        return re.sub(r'<[^>]+>', '', text).strip()
+
+    @staticmethod
+    def _extract_url(text: str) -> str:
+        """Extract URL from HTML anchor tag."""
+        match = re.search(r'href="([^"]+)"', text)
+        return match.group(1) if match else ""
+
+    @classmethod
+    def _extract_inline_references(cls, raw: str) -> list["Reference"]:
+        """Extract references from [[[$$$...$$$]]] markers in the text."""
+        refs = []
+        seen = set()
+        # Match [[[$$$content$$$]]]
+        pattern = r'\[\[\[\$\$\$(.*?)\$\$\$\]\]\]'
+        for match in re.finditer(pattern, raw, re.DOTALL):
+            ref_text = match.group(1).strip()
+            if not ref_text or ref_text in seen:
+                continue
+            seen.add(ref_text)
+
+            # Extract URL from any <a href="..."> tags
+            url = cls._extract_url(ref_text)
+
+            # Strip HTML tags to get clean text
+            clean_ref = cls._strip_html(ref_text)
+            if not clean_ref:
+                continue
+
+            ref = Reference(title=clean_ref, url=url)
+
+            # Try to parse "Author et al. Title. Journal. Year;..."
+            parts = clean_ref.split('. ')
+            if len(parts) >= 2:
+                ref.authors = parts[0]
+                ref.title = '. '.join(parts[1:3]) if len(parts) >= 3 else parts[1]
+                if len(parts) >= 4:
+                    ref.journal = parts[-2] if len(parts) > 4 else parts[3] if len(parts) > 3 else ""
+                year_match = re.search(r'\b(19|20)\d{2}\b', clean_ref)
+                if year_match:
+                    ref.year = year_match.group(0)
+            refs.append(ref)
+        return refs
