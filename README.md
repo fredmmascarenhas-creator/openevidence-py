@@ -2,100 +2,172 @@
 
 **Unofficial** Python client for [OpenEvidence.com](https://www.openevidence.com) — the leading medical information platform powered by AI with citations from NEJM, JAMA, NCCN, Cochrane, and more.
 
-> **Disclaimer**: This is an unofficial, community-driven project. It is not affiliated with, endorsed by, or associated with OpenEvidence Inc. Use responsibly and in accordance with OpenEvidence's Terms of Service.
+Uses **Playwright** (headless browser) to handle FingerprintJS authentication automatically. Supports **multi-user SaaS** integration via credential vault.
+
+> **Disclaimer**: This is an unofficial, community-driven project. Not affiliated with OpenEvidence Inc. Use responsibly.
 
 ## Installation
 
 ```bash
-pip install openevidence-py
+# Install the package
+pip install git+https://github.com/fredmmascarenhas-creator/openevidence-py.git
+
+# Install the browser (required, run once)
+playwright install chromium
 ```
 
-Or install from source:
+Or from source:
 
 ```bash
-git clone https://github.com/your-username/openevidence-py.git
+git clone https://github.com/fredmmascarenhas-creator/openevidence-py.git
 cd openevidence-py
 pip install -e .
+playwright install chromium
+```
+
+## Setup (.env)
+
+```bash
+cp .env.example .env
+# Edit .env with your credentials
+```
+
+```env
+OPENEVIDENCE_EMAIL=your_email@example.com
+OPENEVIDENCE_PASSWORD=your_password
+OPENEVIDENCE_VAULT_KEY=your-secret-key-for-multi-user
 ```
 
 ## Quick Start
 
-### Python API
+### Basic Usage
 
 ```python
 from openevidence import OpenEvidenceClient
 
-# Synchronous usage (simplest)
-client = OpenEvidenceClient()
-article = client.ask_sync("What is the recommended treatment for type 2 diabetes?")
+# With credentials from .env
+with OpenEvidenceClient() as client:
+    article = client.ask("What is the treatment for type 2 diabetes?")
+    print(article.title)
+    print(article.clean_text)
 
-print(article.title)
-print(article.clean_text)
-
-for ref in article.references:
-    print(f"  - {ref.title} ({ref.journal}, {ref.year})")
-
-for q in article.follow_up_questions:
-    print(f"  -> {q}")
+    for ref in article.references:
+        print(f"  - {ref.title} ({ref.journal}, {ref.year})")
 ```
 
-### Async API
+### Without Login (anonymous, may have rate limits)
 
 ```python
-import asyncio
-from openevidence import OpenEvidenceClient
-
-async def main():
-    async with OpenEvidenceClient() as client:
-        # Ask a question and wait for the full response
-        article = await client.ask("What are the side effects of metformin?")
-        print(article.clean_text)
-
-        # Ask a follow-up question
-        followup = await client.ask(
-            "How does it compare to insulin?",
-            original_article=article.id,
-        )
-        print(followup.clean_text)
-
-asyncio.run(main())
+with OpenEvidenceClient() as client:
+    article = client.ask("What is aspirin used for?")
+    print(article.clean_text)
 ```
 
-### Streaming
+### Follow-up Questions
 
 ```python
-import asyncio
-from openevidence import OpenEvidenceClient
+with OpenEvidenceClient() as client:
+    article = client.ask("What is metformin?")
 
-async def main():
-    async with OpenEvidenceClient() as client:
-        async for partial in client.ask_stream("What is aspirin used for?"):
-            print(f"Status: {partial.status.value}, Text length: {len(partial.text)}")
+    # Use the article ID for follow-ups
+    followup = client.ask(
+        "What are the side effects?",
+        original_article=article.id,
+    )
+    print(followup.clean_text)
+```
 
-            if partial.status.value == "success":
-                print(partial.clean_text)
+### Streaming (partial results)
 
-asyncio.run(main())
+```python
+with OpenEvidenceClient() as client:
+    for partial in client.ask_stream("What is aspirin used for?"):
+        print(f"Status: {partial.status.value}")
+        if partial.status.value == "success":
+            print(partial.clean_text)
 ```
 
 ### CLI
 
 ```bash
-# Ask a question (pretty-printed output)
-openevidence ask "What is the recommended treatment for hypertension?"
-
-# Stream the response in real-time
-openevidence ask "What is aspirin used for?" --stream
-
-# Get JSON output (for piping/scripting)
+openevidence ask "What is the treatment for hypertension?"
 openevidence ask "Side effects of ACE inhibitors?" --json
-
-# Follow-up question using a previous article UUID
-openevidence ask "How does it compare to ARBs?" --follow-up <uuid>
-
-# Retrieve an existing article
+openevidence ask "What is aspirin?" --stream
 openevidence get <article-uuid>
-openevidence get <article-uuid> --json
+```
+
+## Multi-User SaaS Integration
+
+For SaaS apps where each user has their own OpenEvidence account:
+
+### Store User Credentials
+
+```python
+from openevidence import CredentialVault
+
+vault = CredentialVault(encryption_key="your-secret-key")
+
+# When a user connects their account in your SaaS
+vault.store_user("user_123", "user@email.com", "their_password")
+vault.store_user("user_456", "other@email.com", "other_password")
+```
+
+### Query on Behalf of a User
+
+```python
+# Each user gets isolated browser session + cookies
+with vault.get_client("user_123") as client:
+    article = client.ask("Treatment for hypertension?")
+    print(article.clean_text)
+```
+
+### FastAPI Backend
+
+```python
+from fastapi import FastAPI
+from openevidence import CredentialVault
+
+app = FastAPI()
+vault = CredentialVault(encryption_key="your-key")
+
+@app.post("/search")
+def search(user_id: str, question: str):
+    with vault.get_client(user_id) as client:
+        article = client.ask(question)
+    return {
+        "title": article.title,
+        "answer": article.clean_text,
+        "references": [
+            {"title": r.title, "journal": r.journal}
+            for r in article.references
+        ],
+    }
+```
+
+See `examples/saas_integration.py` for a complete FastAPI example with NotebookLM integration.
+
+## OpenEvidence + NotebookLM Combo
+
+Combine both unofficial APIs for a medical research pipeline:
+
+```python
+from openevidence import OpenEvidenceClient
+
+# 1. Get evidence from OpenEvidence
+with OpenEvidenceClient() as oe:
+    article = oe.ask("Treatment options for COPD?")
+
+# 2. Send to NotebookLM for organization
+from notebooklm import NotebookLMClient
+
+async with NotebookLMClient() as nb:
+    notebook = await nb.notebooks.create(title=article.title)
+    await nb.sources.add(
+        notebook_id=notebook.id,
+        content=article.clean_text,
+        title=article.title,
+    )
+    # Now you have a NotebookLM notebook with cited medical evidence!
 ```
 
 ## API Reference
@@ -104,23 +176,18 @@ openevidence get <article-uuid> --json
 
 | Parameter       | Type    | Default | Description                          |
 |----------------|---------|---------|--------------------------------------|
-| `base_url`     | `str`   | `https://www.openevidence.com` | Base URL        |
+| `email`        | `str`   | env var | OpenEvidence email                   |
+| `password`     | `str`   | env var | OpenEvidence password                |
+| `headless`     | `bool`  | `True`  | Run browser headless                 |
 | `timeout`      | `float` | `120`   | Request timeout in seconds           |
-| `poll_interval`| `float` | `1.5`   | Seconds between polling attempts     |
+| `poll_interval`| `float` | `2.0`   | Seconds between polling              |
 
-### Methods
+### `CredentialVault`
 
-#### `ask(question, **kwargs) -> Article`
-Ask a question and wait for the complete response.
-
-#### `ask_stream(question, **kwargs) -> AsyncIterator[Article]`
-Ask a question and yield partial results as they arrive.
-
-#### `get_article(article_id) -> Article`
-Retrieve an existing article by UUID.
-
-#### `ask_sync(question, **kwargs) -> Article`
-Synchronous wrapper around `ask()`.
+| Parameter        | Type   | Default              | Description                     |
+|-----------------|--------|----------------------|---------------------------------|
+| `vault_dir`     | `Path` | `~/.openevidence/vault` | Credential storage dir       |
+| `encryption_key`| `str`  | env var              | Encryption key for credentials  |
 
 ### `Article` Model
 
@@ -130,55 +197,25 @@ Synchronous wrapper around `ask()`.
 | `status`            | `ArticleStatus`   | `running`, `success`, `failed`, `queued`     |
 | `title`             | `str`             | Generated title                              |
 | `question`          | `str`             | Original question                            |
-| `text`              | `str`             | Raw response text (with HTML/markers)        |
-| `clean_text`        | `str`             | Cleaned plain text                           |
-| `sections`          | `list[Section]`   | Structured sections with paragraphs          |
+| `clean_text`        | `str`             | Cleaned plain text response                  |
 | `references`        | `list[Reference]` | Citations from medical literature            |
 | `follow_up_questions`| `list[str]`      | Suggested follow-up questions                |
 
 ## How It Works
 
-This library reverse-engineers the OpenEvidence web API:
+1. **Playwright** launches a headless Chromium browser
+2. Visits openevidence.com — FingerprintJS runs and generates a `pizza` token
+3. **POST `/api/article`** with the fingerprint token creates a query
+4. **GET `/api/article/{uuid}`** polls until `status == "success"`
+5. Response is parsed into structured `Article` with clean text and references
+6. Browser session is persisted for reuse (faster subsequent calls)
 
-1. **Session**: Establishes a browser-like HTTP session with cookies by visiting the homepage
-2. **POST `/api/article`**: Submits a question with a generated anti-bot token (`pizza` header)
-3. **GET `/api/article/{uuid}`**: Polls for the response until `status == "success"`
-4. **Parsing**: Extracts clean text, structured sections, references, and follow-up questions
+## Production Notes
 
-### Discovered Endpoints
-
-| Endpoint                     | Method | Description                          |
-|------------------------------|--------|--------------------------------------|
-| `/api/article`               | POST   | Create a new article/query           |
-| `/api/article/{uuid}`        | GET    | Get article status and content       |
-| `/api/article/ct`            | GET    | List articles (requires auth)        |
-| `/api/getTargetCampaign`     | POST   | Campaign targeting                   |
-| `/api/events`                | POST   | Event tracking/analytics             |
-
-### Request Payload Structure
-
-```json
-{
-    "article_type": "Ask OpenEvidence Light with citations",
-    "inputs": {
-        "variant_configuration_file": "prod",
-        "attachments": [],
-        "question": "your question here",
-        "use_gatekeeper": true
-    },
-    "original_article": null,
-    "personalization_enabled": false,
-    "disable_caching": false
-}
-```
-
-## Limitations
-
-- **No authentication**: Currently works without login (anonymous access), which may have rate limits
-- **Polling-based**: Uses polling instead of streaming (the web app polls too)
-- **Fragile**: As with any reverse-engineered API, endpoints may change without notice
-- **Rate limits**: OpenEvidence may impose rate limits on anonymous usage
-- **Not for production medical use**: This is a developer tool, not a medical device
+- For multi-user vault encryption, replace the built-in XOR encryption with a proper secret manager (AWS Secrets Manager, HashiCorp Vault, etc.)
+- Each user's browser session is isolated (separate cookies/fingerprint)
+- Sessions are persisted to disk, so subsequent calls skip the login flow
+- Consider running Playwright in a Docker container for deployment
 
 ## License
 
