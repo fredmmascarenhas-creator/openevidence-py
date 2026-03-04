@@ -2,10 +2,23 @@
 OpenEvidence API Client
 
 Unofficial Python client that interacts with OpenEvidence.com
-using Playwright headless browser automation.
+using Playwright browser automation.
 
-This approach handles FingerprintJS and session management automatically,
-just like a real browser would.
+Supports Google OAuth login:
+  1. First time: browser opens VISIBLE, you login manually via Google
+  2. Session is saved to disk (cookies + tokens)
+  3. All subsequent queries run headless and fast
+
+Usage:
+    # First time — will open a visible browser for Google login
+    client = OpenEvidenceClient()
+    client.interactive_login()  # Opens browser, you login via Google
+    client.close()
+
+    # From now on — headless and fast!
+    with OpenEvidenceClient() as client:
+        article = client.ask("What is metformin?")
+        print(article.clean_text)
 """
 
 from __future__ import annotations
@@ -32,17 +45,18 @@ DEFAULT_STATE_DIR = Path.home() / ".openevidence"
 
 class OpenEvidenceClient:
     """
-    Client for interacting with the OpenEvidence API via headless browser.
+    Client for interacting with the OpenEvidence API via browser.
 
-    Uses Playwright to automate a real browser, which handles FingerprintJS
-    anti-bot protection automatically.
+    Supports two login modes:
+    1. Google OAuth (recommended): Call interactive_login() once, then use headless
+    2. Email/password (Auth0): Set OPENEVIDENCE_EMAIL and OPENEVIDENCE_PASSWORD
 
     Setup:
         1. pip install openevidence-py
         2. playwright install chromium
-        3. Set OPENEVIDENCE_EMAIL and OPENEVIDENCE_PASSWORD in .env (optional)
+        3. Run interactive_login() once to save your Google session
 
-    Usage:
+    Usage (after login saved):
         with OpenEvidenceClient() as client:
             article = client.ask("What is the treatment for diabetes?")
             print(article.clean_text)
@@ -60,14 +74,15 @@ class OpenEvidenceClient:
     ):
         """
         Args:
-            email: OpenEvidence account email. Falls back to OPENEVIDENCE_EMAIL env var.
-            password: OpenEvidence account password. Falls back to OPENEVIDENCE_PASSWORD env var.
-            headless: Run browser in headless mode (default: True for backend use).
+            email: OpenEvidence email (for Auth0 login). Falls back to env var.
+            password: OpenEvidence password (for Auth0 login). Falls back to env var.
+            headless: Run browser headless (default: True). Set False for interactive_login().
             base_url: OpenEvidence base URL.
             timeout: Request timeout in seconds.
             poll_interval: Seconds between polling attempts.
             state_dir: Directory to store browser session state.
         """
+        self._load_dotenv()
         self.email = email or os.environ.get("OPENEVIDENCE_EMAIL")
         self.password = password or os.environ.get("OPENEVIDENCE_PASSWORD")
         self.headless = headless
@@ -82,12 +97,159 @@ class OpenEvidenceClient:
         self._context = None
         self._page = None
 
+    @staticmethod
+    def _load_dotenv():
+        """Load .env file without requiring python-dotenv."""
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            return
+        except ImportError:
+            pass
+
+        for env_path in [Path(".env"), Path(__file__).parent.parent / ".env"]:
+            if env_path.exists():
+                with open(env_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key and value:
+                            os.environ.setdefault(key, value)
+                break
+
     def __enter__(self) -> "OpenEvidenceClient":
         self._start_browser()
         return self
 
     def __exit__(self, *args) -> None:
         self.close()
+
+    def has_saved_session(self) -> bool:
+        """Check if a saved session exists from a previous login."""
+        return self._state_file.exists()
+
+    def interactive_login(self, timeout: int = 120) -> None:
+        """
+        Open a VISIBLE browser for manual login (Google OAuth, etc.).
+
+        The browser will open openevidence.com — click "Log In" and
+        sign in with your Google account. Once logged in, the session
+        is saved automatically.
+
+        This only needs to be done ONCE. After that, all queries
+        can run headless.
+
+        Args:
+            timeout: Max seconds to wait for login (default: 120).
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise OpenEvidenceError(
+                "Playwright is required. Install it with:\n"
+                "  pip install playwright\n"
+                "  playwright install chromium"
+            )
+
+        print("\n" + "=" * 60)
+        print("  OPENEVIDENCE - LOGIN INTERATIVO")
+        print("=" * 60)
+        print("\nUm navegador vai abrir. Siga estes passos:")
+        print("  1. Clique em 'Log In'")
+        print("  2. Clique em 'Continue with Google'")
+        print("  3. Escolha sua conta Google e faça login")
+        print("  4. Quando voltar ao OpenEvidence logado,")
+        print("     a sessão será salva automaticamente.")
+        print(f"\nVocê tem {timeout} segundos para completar o login.")
+        print("=" * 60 + "\n")
+
+        pw = sync_playwright().start()
+        try:
+            browser = pw.chromium.launch(
+                headless=False,  # ALWAYS visible for interactive login
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+
+            # Hide automation indicators
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            """)
+
+            # Navigate to OpenEvidence
+            page.goto(self.base_url, wait_until="domcontentloaded", timeout=60000)
+
+            # Wait for user to complete login
+            # We detect login by checking if the "Log In" button disappears
+            # or if certain auth cookies appear
+            print("Aguardando login... (faça login no navegador)")
+
+            start_time = time.time()
+            logged_in = False
+
+            while time.time() - start_time < timeout:
+                time.sleep(2)
+
+                # Check if logged in: "Log In" button should be gone
+                try:
+                    login_btn = page.query_selector('text="Log In"')
+                    if login_btn is None:
+                        # Double check — make sure page is actually loaded
+                        url = page.url
+                        if "openevidence.com" in url and "auth" not in url.lower():
+                            logged_in = True
+                            break
+                except Exception:
+                    pass
+
+                # Also check for user menu / avatar as sign of being logged in
+                try:
+                    avatar = page.query_selector('[data-testid="user-menu"]') or \
+                             page.query_selector('img[alt*="avatar"]') or \
+                             page.query_selector('button:has-text("Account")')
+                    if avatar:
+                        logged_in = True
+                        break
+                except Exception:
+                    pass
+
+            if logged_in:
+                # Wait a bit for all cookies to settle
+                page.wait_for_timeout(3000)
+
+                # Save session state
+                self.state_dir.mkdir(parents=True, exist_ok=True)
+                context.storage_state(path=str(self._state_file))
+
+                print("\n✅ Login salvo com sucesso!")
+                print(f"   Sessão salva em: {self._state_file}")
+                print("   Agora você pode usar o client em modo headless.")
+                print("   Todas as buscas serão rápidas!\n")
+            else:
+                print("\n❌ Timeout! Login não foi detectado.")
+                print("   Tente novamente com: client.interactive_login()")
+
+            page.close()
+            context.close()
+            browser.close()
+
+        finally:
+            pw.stop()
 
     def _start_browser(self):
         """Launch the browser and set up the page."""
@@ -101,7 +263,13 @@ class OpenEvidenceClient:
             )
 
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=self.headless)
+        self._browser = self._playwright.chromium.launch(
+            headless=self.headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
 
         # Try to restore previous session state
         if self._state_file.exists():
@@ -121,16 +289,39 @@ class OpenEvidenceClient:
 
         self._page = self._context.new_page()
 
-        # Navigate to homepage and wait for FingerprintJS to initialize
-        self._page.goto(self.base_url, wait_until="networkidle")
-        self._page.wait_for_timeout(2000)
+        # Hide automation indicators
+        self._page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        """)
 
-        # Login if credentials are provided and not already logged in
-        if self.email and self.password:
-            self._ensure_logged_in()
+        # Navigate to homepage
+        self._page.goto(self.base_url, wait_until="domcontentloaded", timeout=60000)
+        # Wait for FingerprintJS to initialize
+        self._page.wait_for_timeout(5000)
+
+        # Check if session is still valid
+        if not self._is_logged_in():
+            if self.email and self.password:
+                # Try Auth0 email/password login
+                self._auth0_login()
+            elif not self.has_saved_session():
+                print(
+                    "\n⚠️  Não logado! Execute primeiro:\n"
+                    "    from openevidence import OpenEvidenceClient\n"
+                    "    client = OpenEvidenceClient()\n"
+                    "    client.interactive_login()\n"
+                )
 
         # Save session state for reuse
         self._save_state()
+
+    def _is_logged_in(self) -> bool:
+        """Check if currently logged in to OpenEvidence."""
+        try:
+            login_btn = self._page.query_selector('text="Log In"')
+            return login_btn is None
+        except Exception:
+            return False
 
     def _new_context(self):
         """Create a fresh browser context."""
@@ -143,45 +334,42 @@ class OpenEvidenceClient:
             viewport={"width": 1280, "height": 800},
         )
 
-    def _ensure_logged_in(self):
-        """Login to OpenEvidence if not already logged in."""
+    def _auth0_login(self):
+        """Login via Auth0 email/password (non-Google flow)."""
         page = self._page
 
-        # Check if already logged in by looking for the "Log In" button
         login_btn = page.query_selector('text="Log In"')
         if not login_btn:
             return  # Already logged in
 
         login_btn.click()
+        page.wait_for_timeout(3000)
+
+        # Auth0 login flow
+        email_input = page.wait_for_selector('#username', timeout=15000)
+        if email_input:
+            email_input.click()
+            email_input.fill(self.email)
+            page.wait_for_timeout(500)
+
+        page.keyboard.press("Enter")
         page.wait_for_timeout(2000)
 
-        # Fill in email
-        email_input = page.wait_for_selector('input[type="email"], input[name="email"]', timeout=10000)
-        if email_input:
-            email_input.fill(self.email)
+        password_input = page.query_selector('input[type="password"]')
+        if not password_input:
+            password_input = page.wait_for_selector('input[type="password"]', timeout=10000)
 
-        # Look for "Continue" or "Next" button
-        continue_btn = page.query_selector('button:has-text("Continue")') or \
-                       page.query_selector('button:has-text("Next")')
-        if continue_btn:
-            continue_btn.click()
-            page.wait_for_timeout(1000)
-
-        # Fill in password
-        password_input = page.wait_for_selector('input[type="password"]', timeout=10000)
         if password_input:
+            password_input.click()
             password_input.fill(self.password)
+            page.wait_for_timeout(500)
+            page.keyboard.press("Enter")
 
-        # Submit
-        submit_btn = page.query_selector('button[type="submit"]') or \
-                     page.query_selector('button:has-text("Log In")') or \
-                     page.query_selector('button:has-text("Sign In")')
-        if submit_btn:
-            submit_btn.click()
-
-        # Wait for login to complete
-        page.wait_for_timeout(3000)
-        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(5000)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
 
         self._save_state()
 
@@ -191,7 +379,7 @@ class OpenEvidenceClient:
         try:
             self._context.storage_state(path=str(self._state_file))
         except Exception:
-            pass  # Not critical if save fails
+            pass
 
     def close(self) -> None:
         """Close the browser and clean up resources."""
@@ -249,13 +437,12 @@ class OpenEvidenceClient:
         page = self._page
 
         # Use the page's JavaScript context to make the API call
-        # This way, the FingerprintJS token and cookies are handled by the browser
+        # This way, FingerprintJS token and cookies are handled by the browser
         create_script = """
         async ({question, article_type, original_article}) => {
-            // Wait for FingerprintJS to be ready and get the requestId
+            // Get FingerprintJS requestId from sessionStorage
             let pizza = null;
 
-            // Check sessionStorage for FingerprintJS data
             for (let i = 0; i < sessionStorage.length; i++) {
                 const key = sessionStorage.key(i);
                 if (key.includes('fpjs')) {
@@ -269,7 +456,7 @@ class OpenEvidenceClient:
             }
 
             if (!pizza) {
-                // FingerprintJS hasn't run yet, wait a bit
+                // FingerprintJS hasn't run yet, wait and retry
                 await new Promise(r => setTimeout(r, 3000));
                 for (let i = 0; i < sessionStorage.length; i++) {
                     const key = sessionStorage.key(i);
@@ -356,7 +543,6 @@ class OpenEvidenceClient:
 
         page = self._page
 
-        # Create article using browser JS context
         create_script = """
         async ({question, article_type, original_article}) => {
             let pizza = null;
@@ -421,7 +607,7 @@ class OpenEvidenceClient:
             time.sleep(self.poll_interval)
             attempts += 1
 
-            data = page.evaluate(
+            data = self._page.evaluate(
                 """async (id) => {
                     const r = await fetch('/api/article/' + id);
                     if (!r.ok) return null;
